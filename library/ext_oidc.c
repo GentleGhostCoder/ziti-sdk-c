@@ -332,6 +332,9 @@ static void internal_config_cb(tlsuv_http_resp_t *r, const char * err, json_obje
         }
     } else {
         OIDC_LOG(ERROR, "OIDC provider configuration failed: %s", err);
+        // drop the empty object that marks a request in flight: the next ext_oidc_client_start() requests again
+        json_object_put(clt->config);
+        clt->config = NULL;
         if (clt->token_cb) {
             clt->token_cb(clt, EXT_OIDC_CONFIG_FAILED, err);
         }
@@ -506,7 +509,7 @@ static void request_token(auth_req *req, const char *auth_code) {
     ext_oidc_client_t *clt = req->clt;
     json_object *token_ep = json_object_object_get(clt->config, TOKEN_EP);
     const char *token_url = json_object_get_string(token_ep);
-    ZITI_LOG(INFO, "requesting token path[%s] auth[%s]", token_url, auth_code);
+    ZITI_LOG(INFO, "requesting token path[%s]", token_url);
     tlsuv_http_set_url(&clt->http, token_url);
     tlsuv_http_req_t *token_req = ziti_json_request(&clt->http, "POST", NULL, token_cb, req);
     tlsuv_http_pair form[] = {
@@ -630,7 +633,9 @@ static void ext_accept(uv_work_t *wr) {
     buf[c] = 0;
 
     char *cs = strstr(buf, "code=");
-    if (!cs) {
+    // the code is part of the request target, and a space ends the target in a complete request line
+    char *ce = cs ? strchr(cs, ' ') : NULL;
+    if (!ce) {
         ZITI_LOG(WARN, "no code parameter found: %s", buf);
         char resp[] = "HTTP/1.1 400 Invalid Request\r\n"
                       "Content-Type: text/html\r\n"
@@ -650,7 +655,6 @@ static void ext_accept(uv_work_t *wr) {
         return;
     }
     cs += strlen("code=");
-    char *ce = strchr(cs, ' ');
     *ce = 0;
     char *amp = strchr(cs, '&');
     if (amp) {
@@ -992,6 +996,13 @@ static void refresh_cb(tlsuv_http_resp_t *http_resp, const char *err, json_objec
     if (http_resp->code == 200 && resp != NULL) {
         OIDC_LOG(DEBUG,  "token refresh success");
         clt->refresh_failures = 0;
+        // RFC 6749 section 6: the response may omit refresh_token, the one that was sent stays in use
+        if (json_object_is_type(resp, json_type_object) && json_object_object_get(resp, "refresh_token") == NULL) {
+            json_object *sent = json_object_object_get(clt->tokens, "refresh_token");
+            if (sent != NULL) {
+                json_object_object_add(resp, "refresh_token", json_object_get(sent));
+            }
+        }
         ext_oidc_client_set_tokens(clt, resp);
         return;
     }
@@ -1021,21 +1032,10 @@ static void refresh_cb(tlsuv_http_resp_t *http_resp, const char *err, json_objec
     clt->token_cb(clt, EXT_OIDC_RESTART, NULL);
 }
 
-static const char* get_basic_auth_header(const char *client_id) {
-    static char header[256];
-    char auth[128];
-    char auth64[sodium_base64_ENCODED_LEN(sizeof(auth), sodium_base64_VARIANT_URLSAFE)];
-    size_t auth_len = snprintf(auth, sizeof(auth), "%s:", client_id);
-    sodium_bin2base64(auth64, sizeof(auth64), (uint8_t*)auth, auth_len, sodium_base64_VARIANT_URLSAFE);
-    snprintf(header, sizeof(header), "Basic %s", auth64);
-    return header;
-}
-
 static void ext_refresh_time_cb(uv_timer_t *t) {
     uv_unref((uv_handle_t *) t);
     ext_oidc_client_t *clt = t->data;
     OIDC_LOG(DEBUG, "refreshing OIDC token");
-    assert(clt->config);
 
     if (clt->refresh_req) {
         // as in oidc.c's oidc_client_refresh: a refresh_req still set when
@@ -1055,13 +1055,13 @@ static void ext_refresh_time_cb(uv_timer_t *t) {
         return;
     }
 
+    // tokens come from a login, and a login needs the configuration
+    assert(clt->config);
     struct json_object *token_ep = json_object_object_get(clt->config, TOKEN_EP);
     const char *token_url = json_object_get_string(token_ep);
 
     tlsuv_http_set_url(&clt->http, token_url);
     tlsuv_http_req_t *req = ziti_json_request(&clt->http, "POST", NULL, refresh_cb, clt);
-    tlsuv_http_req_header(req, HTTP_AUTHORIZATION,
-                          get_basic_auth_header(clt->signer_cfg.client_id));
     const char *refresher = json_object_get_string(tok);
     tlsuv_http_req_form(req, 3, (tlsuv_http_pair[]) {
         {"client_id",     clt->signer_cfg.client_id},
